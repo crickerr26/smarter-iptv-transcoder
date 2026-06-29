@@ -107,8 +107,8 @@ function hlsArgs(profile, dir, playlist) {
   const live = profile === 'live';
   return [
     '-f', 'hls',
-    '-hls_time', live ? '2' : '3',
-    '-hls_list_size', live ? '8' : '0',
+    '-hls_time', live ? '4' : '6',
+    '-hls_list_size', live ? '15' : '0',
     '-hls_flags', live
       ? 'delete_segments+append_list+omit_endlist+independent_segments'
       : 'independent_segments',
@@ -150,10 +150,16 @@ function start(url, profile = 'mobile') {
   return session;
 }
 
-async function waitForPlaylist(file, ms = 9000) {
+async function waitForPlaylist(file, ms = 18000) {
   const startAt = Date.now();
   while (Date.now() - startAt < ms) {
-    if (fs.existsSync(file) && fs.statSync(file).size > 80) return true;
+    if (fs.existsSync(file)) {
+      try {
+        const content = fs.readFileSync(file, 'utf8');
+        const segments = (content.match(/#EXTINF:/g) || []).length;
+        if (segments >= 2 || content.includes('#EXT-X-ENDLIST')) return true;
+      } catch (e) {}
+    }
     await new Promise(resolve => setTimeout(resolve, 250));
   }
   return false;
