@@ -11,7 +11,6 @@ const FFMPEG = process.env.FFMPEG_PATH || 'ffmpeg';
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 30 * 60 * 1000);
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
-const LOW_CPU_MODE = /^(1|true|yes)$/i.test(process.env.LOW_CPU_MODE || '');
 
 fs.mkdirSync(MEDIA_ROOT, { recursive: true });
 
@@ -58,31 +57,21 @@ function safePath(id, file = '') {
 }
 
 function profileArgs(profile) {
-  if (profile === 'audio') return ['-vn', '-c:a', 'aac', '-b:a', '128k'];
+  if (profile === 'audio') return ['-vn', '-c:a', 'aac', '-b:a', '96k'];
   if (profile === 'copy') return ['-c', 'copy'];
-  if (LOW_CPU_MODE || profile === 'remux') {
-    return [
-      '-map', '0:v:0?',
-      '-map', '0:a:0?',
-      '-c:v', 'copy',
-      '-c:a', 'aac',
-      '-b:a', '128k',
-      '-ac', '2'
-    ];
-  }
-  const videoBitrate = profile === 'vod' ? '2400k' : '1800k';
-  const maxrate = profile === 'vod' ? '2800k' : '2200k';
-  const bufsize = profile === 'vod' ? '5200k' : '3600k';
+  const videoBitrate = profile === 'vod' ? '1200k' : '750k';
+  const maxrate = profile === 'vod' ? '1500k' : '900k';
+  const bufsize = profile === 'vod' ? '3000k' : '1800k';
   return [
     '-map', '0:v:0?',
     '-map', '0:a:0?',
     '-c:v', 'libx264',
-    '-preset', 'veryfast',
+    '-preset', 'superfast',
     '-tune', 'zerolatency',
     '-profile:v', 'main',
-    '-level', '4.0',
+    '-level', '3.1',
     '-pix_fmt', 'yuv420p',
-    '-vf', 'scale=w=min(1280\\,iw):h=-2',
+    '-vf', 'scale=w=min(854\\,iw):h=-2',
     '-g', '50',
     '-keyint_min', '50',
     '-sc_threshold', '0',
@@ -90,7 +79,7 @@ function profileArgs(profile) {
     '-maxrate', maxrate,
     '-bufsize', bufsize,
     '-c:a', 'aac',
-    '-b:a', '128k',
+    '-b:a', '96k',
     '-ac', '2'
   ];
 }
