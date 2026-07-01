@@ -87,12 +87,14 @@ function profileArgs(profile) {
 function inputArgs(profile, url) {
   const liveTuning = profile === 'live' ? [
     '-fflags', '+genpts+discardcorrupt',
-    '-analyzeduration', '1000000',
-    '-probesize', '1000000'
+    '-analyzeduration', '2500000',
+    '-probesize', '5000000'
   ] : ['-fflags', '+genpts+discardcorrupt'];
   return [
     '-hide_banner',
     '-loglevel', 'warning',
+    '-user_agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    '-err_detect', 'ignore_err',
     '-reconnect', '1',
     '-reconnect_streamed', '1',
     '-reconnect_at_eof', '1',
