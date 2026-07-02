@@ -25,8 +25,9 @@ const mime = {
 function send(res, status, body, headers = {}) {
   res.writeHead(status, {
     'access-control-allow-origin': CORS_ORIGIN,
-    'access-control-allow-methods': 'GET,OPTIONS',
-    'access-control-allow-headers': 'content-type,range',
+    'access-control-allow-methods': 'GET,HEAD,OPTIONS',
+    'access-control-allow-headers': 'content-type,range,authorization',
+    'access-control-expose-headers': 'content-length,content-range,accept-ranges',
     'cache-control': 'no-store',
     ...headers
   });
@@ -50,9 +51,9 @@ function sessionId(url, profile) {
 }
 
 function safePath(id, file = '') {
-  const dir = path.join(MEDIA_ROOT, id);
-  const target = path.join(dir, file);
-  if (!target.startsWith(dir)) throw new Error('Bad path');
+  const dir = path.resolve(MEDIA_ROOT, id);
+  const target = path.resolve(dir, file);
+  if (target !== dir && !target.startsWith(dir + path.sep)) throw new Error('Bad path');
   return { dir, target };
 }
 
@@ -112,8 +113,9 @@ function hlsArgs(profile, dir, playlist) {
     '-hls_time', live ? '4' : '6',
     '-hls_list_size', live ? '15' : '0',
     '-hls_flags', live
-      ? 'delete_segments+append_list+omit_endlist+independent_segments'
-      : 'independent_segments',
+      ? 'delete_segments+append_list+omit_endlist+independent_segments+temp_file'
+      : 'independent_segments+temp_file',
+    '-hls_allow_cache', live ? '0' : '1',
     '-hls_segment_filename', path.join(dir, 'seg_%05d.ts'),
     playlist
   ];
@@ -135,12 +137,21 @@ function start(url, profile = 'mobile') {
   const args = [
     ...inputArgs(profile, url),
     ...profileArgs(profile),
-    '-max_muxing_queue_size', '2048',
+    '-avoid_negative_ts', 'make_zero',
+    '-muxdelay', '0',
+    '-muxpreload', '0',
+    '-max_muxing_queue_size', '4096',
     ...hlsArgs(profile, dir, playlist)
   ];
 
+  const session = { id, url, profile, child: null, playlist, dir, created: Date.now(), lastAccess: Date.now(), exited: false, log: '' };
   const child = spawn(FFMPEG, args, { stdio: ['ignore', 'ignore', 'pipe'] });
-  const session = { id, url, profile, child, playlist, dir, created: Date.now(), lastAccess: Date.now(), exited: false, log: '' };
+  session.child = child;
+  child.on('error', error => {
+    session.exited = true;
+    session.exitCode = -1;
+    session.log = (`FFmpeg failed to start: ${error.message}\n` + session.log).slice(-4000);
+  });
   child.stderr.on('data', chunk => {
     session.log = (session.log + chunk.toString()).slice(-4000);
   });
@@ -152,9 +163,11 @@ function start(url, profile = 'mobile') {
   return session;
 }
 
-async function waitForPlaylist(file, ms = 18000) {
+async function waitForPlaylist(session, ms = 30000) {
+  const file = session.playlist;
   const startAt = Date.now();
   while (Date.now() - startAt < ms) {
+    if (session.exited && !fs.existsSync(file)) return false;
     if (fs.existsSync(file)) {
       try {
         const content = fs.readFileSync(file, 'utf8');
@@ -163,6 +176,20 @@ async function waitForPlaylist(file, ms = 18000) {
       } catch (e) {}
     }
     await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  return false;
+}
+
+async function waitForFile(file, ms = 8000) {
+  const startAt = Date.now();
+  while (Date.now() - startAt < ms) {
+    if (fs.existsSync(file)) {
+      try {
+        const stat = fs.statSync(file);
+        if (stat.size > 0) return true;
+      } catch (e) {}
+    }
+    await new Promise(resolve => setTimeout(resolve, 150));
   }
   return false;
 }
@@ -181,6 +208,7 @@ setInterval(cleanup, 60 * 1000).unref();
 const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'OPTIONS') return send(res, 204, '');
+    if (!['GET', 'HEAD'].includes(req.method)) return send(res, 405, 'Method not allowed');
     const u = new URL(req.url, `http://${req.headers.host}`);
 
     if (u.pathname === '/health') {
@@ -193,7 +221,7 @@ const server = http.createServer(async (req, res) => {
       const profile = u.searchParams.get('profile') || 'mobile';
       if (!source || !/^https?:\/\//i.test(source)) return json(res, 400, { error: 'Missing url' });
       const session = start(source, profile);
-      const ok = await waitForPlaylist(session.playlist);
+      const ok = await waitForPlaylist(session);
       if (!ok) return json(res, 504, { error: 'Transcoder did not produce HLS yet', log: session.log });
       const location = `${PUBLIC_BASE_URL || ''}/sessions/${session.id}/index.m3u8`;
       res.writeHead(302, {
@@ -212,12 +240,44 @@ const server = http.createServer(async (req, res) => {
       if (!session) return json(res, 404, { error: 'Session expired' });
       session.lastAccess = Date.now();
       const { target } = safePath(id, file);
-      if (!fs.existsSync(target)) return json(res, 404, { error: 'Not ready' });
       const ext = path.extname(target);
-      res.writeHead(200, {
+      const ready = await waitForFile(target, ext === '.m3u8' ? 5000 : 10000);
+      if (!ready) return json(res, 404, { error: 'Not ready' });
+      const stat = fs.statSync(target);
+      const baseHeaders = {
         'access-control-allow-origin': CORS_ORIGIN,
+        'access-control-expose-headers': 'content-length,content-range,accept-ranges',
         'cache-control': ext === '.m3u8' ? 'no-store' : 'public, max-age=120',
-        'content-type': mime[ext] || 'application/octet-stream'
+        'content-type': mime[ext] || 'application/octet-stream',
+        'accept-ranges': 'bytes'
+      };
+      if (req.method === 'HEAD') {
+        res.writeHead(200, { ...baseHeaders, 'content-length': stat.size });
+        return res.end();
+      }
+      const range = req.headers.range;
+      if (range) {
+        const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+        if (match) {
+          let start = match[1] ? Number(match[1]) : 0;
+          let end = match[2] ? Number(match[2]) : stat.size - 1;
+          if (!match[1] && match[2]) start = Math.max(0, stat.size - end);
+          end = Math.min(end, stat.size - 1);
+          if (start <= end && start < stat.size) {
+            res.writeHead(206, {
+              ...baseHeaders,
+              'content-range': `bytes ${start}-${end}/${stat.size}`,
+              'content-length': end - start + 1
+            });
+            return fs.createReadStream(target, { start, end }).pipe(res);
+          }
+        }
+        res.writeHead(416, { ...baseHeaders, 'content-range': `bytes */${stat.size}` });
+        return res.end();
+      }
+      res.writeHead(200, {
+        ...baseHeaders,
+        'content-length': stat.size
       });
       return fs.createReadStream(target).pipe(res);
     }
