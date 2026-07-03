@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
+const sqlite3 = require('sqlite3').verbose();
 
 const PORT = Number(process.env.PORT || 8080);
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
@@ -12,7 +13,26 @@ const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 30 * 60 * 1000);
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
 
+// 🔒 Secure Master IPTV Credentials & Admin Key
+const MASTER_IPTV_URL = process.env.IPTV_URL || 'http://portal.example.com:8080';
+const MASTER_IPTV_USER = process.env.IPTV_USER || 'media26';
+const MASTER_IPTV_PASS = process.env.IPTV_PASS || 'media26';
+const ADMIN_API_KEY = process.env.ADMIN_KEY || 'super_secret_admin_key';
+
 fs.mkdirSync(MEDIA_ROOT, { recursive: true });
+
+// Initialize Licensing Database
+const db = new sqlite3.Database(path.join(__dirname, 'licenses.db'), (err) => {
+  if (err) console.error("DB Error:", err.message);
+  db.run(`CREATE TABLE IF NOT EXISTS customers (
+      code TEXT PRIMARY KEY,
+      status TEXT DEFAULT 'active',
+      device_id TEXT,
+      created_at INTEGER,
+      expires_at INTEGER,
+      last_login INTEGER
+  )`);
+});
 
 const sessions = new Map();
 const mime = {
@@ -25,8 +45,8 @@ const mime = {
 function send(res, status, body, headers = {}) {
   res.writeHead(status, {
     'access-control-allow-origin': CORS_ORIGIN,
-    'access-control-allow-methods': 'GET,HEAD,OPTIONS',
-    'access-control-allow-headers': 'content-type,range,authorization',
+    'access-control-allow-methods': 'GET,HEAD,POST,OPTIONS',
+    'access-control-allow-headers': 'content-type,range,authorization,x-admin-key',
     'access-control-expose-headers': 'content-length,content-range,accept-ranges',
     'cache-control': 'no-store',
     ...headers
@@ -205,11 +225,97 @@ function cleanup() {
 }
 setInterval(cleanup, 60 * 1000).unref();
 
+function parseJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', chunk => { body += chunk.toString(); if (body.length > 1e6) { req.connection.destroy(); reject(new Error('Payload too large')); }});
+    req.on('end', () => { try { resolve(JSON.parse(body || '{}')); } catch (e) { reject(new Error('Invalid JSON')); }});
+    req.on('error', reject);
+  });
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'OPTIONS') return send(res, 204, '');
-    if (!['GET', 'HEAD'].includes(req.method)) return send(res, 405, 'Method not allowed');
+    if (!['GET', 'HEAD', 'POST'].includes(req.method)) return send(res, 405, 'Method not allowed');
     const u = new URL(req.url, `http://${req.headers.host}`);
+
+    // --- LICENSING & ADMIN API ROUTES ---
+    if (u.pathname.startsWith('/api/')) {
+      if (req.method !== 'POST' && req.method !== 'GET') return json(res, 405, { error: 'Method not allowed' });
+      
+      // CLIENT ACTIVATION (Called by index.html)
+      if (u.pathname === '/api/activate') {
+        const body = await parseJsonBody(req);
+        const code = String(body.code || '').trim().toUpperCase();
+        const deviceId = String(body.deviceId || '').trim();
+        if (!code || !deviceId) return json(res, 400, { error: 'Code and Device ID required' });
+
+        return await new Promise((resolve) => {
+          db.get(`SELECT * FROM customers WHERE code = ?`, [code], (err, row) => {
+            if (err || !row) return resolve(json(res, 401, { error: 'Invalid activation code' }));
+            if (row.status !== 'active') return resolve(json(res, 403, { error: 'Subscription ' + row.status }));
+            if (row.expires_at > 0 && Date.now() > row.expires_at) {
+              db.run(`UPDATE customers SET status = 'expired' WHERE code = ?`, [code]);
+              return resolve(json(res, 403, { error: 'Subscription expired' }));
+            }
+            if (row.device_id && row.device_id !== deviceId) {
+              return resolve(json(res, 403, { error: 'Code is bound to another device. Contact support to reset.' }));
+            }
+            db.run(`UPDATE customers SET device_id = ?, last_login = ? WHERE code = ?`, [deviceId, Date.now(), code]);
+            resolve(json(res, 200, {
+              token: crypto.randomBytes(16).toString('hex'),
+              portalUrl: MASTER_IPTV_URL,
+              username: MASTER_IPTV_USER,
+              password: MASTER_IPTV_PASS
+            }));
+          });
+        });
+      }
+
+      // ADMIN DASHBOARD PROTECTION
+      const adminKey = req.headers['x-admin-key'];
+      if (adminKey !== ADMIN_API_KEY) return json(res, 401, { error: 'Unauthorized' });
+
+      // ADMIN: GENERATE SUBSCRIPTION CODE
+      if (u.pathname === '/api/admin/generate') {
+        const body = await parseJsonBody(req);
+        const days = Number(body.days || 0); // 0 = lifetime
+        const newCode = 'M26-' + crypto.randomBytes(3).toString('hex').toUpperCase();
+        const expiresAt = days > 0 ? Date.now() + (days * 24 * 60 * 60 * 1000) : 0;
+        return await new Promise((resolve) => {
+          db.run(`INSERT INTO customers (code, created_at, expires_at) VALUES (?, ?, ?)`, [newCode, Date.now(), expiresAt], (err) => {
+            if (err) return resolve(json(res, 500, { error: 'Database error' }));
+            resolve(json(res, 200, { success: true, code: newCode, expires_at: expiresAt }));
+          });
+        });
+      }
+
+      // ADMIN: RESET DEVICE (Allow user to switch TVs)
+      if (u.pathname === '/api/admin/reset-device') {
+        const body = await parseJsonBody(req);
+        const targetCode = String(body.code || '').trim().toUpperCase();
+        return await new Promise((resolve) => {
+          db.run(`UPDATE customers SET device_id = NULL WHERE code = ?`, [targetCode], function(err) {
+            if (this.changes === 0) return resolve(json(res, 404, { error: 'Code not found' }));
+            resolve(json(res, 200, { success: true, message: 'Device reset successfully' }));
+          });
+        });
+      }
+
+      // ADMIN: LIST CUSTOMERS
+      if (u.pathname === '/api/admin/customers') {
+        return await new Promise((resolve) => {
+          db.all(`SELECT * FROM customers ORDER BY created_at DESC`, (err, rows) => {
+            if (err) return resolve(json(res, 500, { error: 'Database error' }));
+            resolve(json(res, 200, { total: rows.length, customers: rows }));
+          });
+        });
+      }
+
+      return json(res, 404, { error: 'API endpoint not found' });
+    }
+    // --- END API ROUTES ---
 
     if (u.pathname === '/health') {
       return json(res, 200, { ok: true, sessions: sessions.size });
