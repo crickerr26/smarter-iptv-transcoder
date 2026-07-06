@@ -1,10 +1,11 @@
+
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 const sqlite3 = require('sqlite3').verbose();
-
+ 
 const PORT = Number(process.env.PORT || 8080);
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
 const MEDIA_ROOT = process.env.MEDIA_ROOT || path.join('/tmp', 'smarter-iptv-hls');
@@ -12,15 +13,15 @@ const FFMPEG = process.env.FFMPEG_PATH || 'ffmpeg';
 const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 30 * 60 * 1000);
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
 const ACCESS_TOKEN = process.env.ACCESS_TOKEN || '';
-
+ 
 // 🔒 Secure Master IPTV Credentials & Admin Key
 const MASTER_IPTV_URL = process.env.IPTV_URL || 'http://portal.example.com:8080';
 const MASTER_IPTV_USER = process.env.IPTV_USER || 'media26';
 const MASTER_IPTV_PASS = process.env.IPTV_PASS || 'media26';
 const ADMIN_API_KEY = process.env.ADMIN_KEY || 'super_secret_admin_key';
-
+ 
 fs.mkdirSync(MEDIA_ROOT, { recursive: true });
-
+ 
 // Initialize Licensing Database
 const db = new sqlite3.Database(path.join(__dirname, 'licenses.db'), (err) => {
   if (err) console.error("DB Error:", err.message);
@@ -33,7 +34,7 @@ const db = new sqlite3.Database(path.join(__dirname, 'licenses.db'), (err) => {
       last_login INTEGER
   )`);
 });
-
+ 
 const sessions = new Map();
 const mime = {
   '.m3u8': 'application/vnd.apple.mpegurl',
@@ -41,7 +42,19 @@ const mime = {
   '.m4s': 'video/iso.segment',
   '.mp4': 'video/mp4'
 };
-
+const staticMime = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.svg': 'image/svg+xml',
+  '.webp': 'image/webp',
+  '.ico': 'image/x-icon'
+};
+const STATIC_ALLOW = new Set(['index.html', 'admin.html', 'hls.min.js', 'mpegts.min.js', 'Logo.png', 'favicon.ico']);
+ 
 function send(res, status, body, headers = {}) {
   res.writeHead(status, {
     'access-control-allow-origin': CORS_ORIGIN,
@@ -53,11 +66,11 @@ function send(res, status, body, headers = {}) {
   });
   res.end(body);
 }
-
+ 
 function json(res, status, data) {
   send(res, status, JSON.stringify(data), { 'content-type': 'application/json' });
 }
-
+ 
 function authorized(u) {
   if (!ACCESS_TOKEN) return true;
   const token = u.searchParams.get('token') || '';
@@ -65,21 +78,22 @@ function authorized(u) {
   const b = Buffer.from(ACCESS_TOKEN);
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
-
+ 
 function sessionId(url, profile) {
   return crypto.createHash('sha1').update(`${profile}\n${url}`).digest('hex').slice(0, 24);
 }
-
+ 
 function safePath(id, file = '') {
   const dir = path.resolve(MEDIA_ROOT, id);
   const target = path.resolve(dir, file);
   if (target !== dir && !target.startsWith(dir + path.sep)) throw new Error('Bad path');
   return { dir, target };
 }
-
+ 
 function profileArgs(profile) {
   if (profile === 'audio') return ['-vn', '-c:a', 'aac', '-b:a', '96k'];
   if (profile === 'copy') return ['-c', 'copy'];
+  if (profile === 'remux') return ['-map', '0:v:0?', '-map', '0:a:0?', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k', '-ac', '2'];
   const videoBitrate = profile === 'vod' ? '1200k' : '750k';
   const maxrate = profile === 'vod' ? '1500k' : '900k';
   const bufsize = profile === 'vod' ? '3000k' : '1800k';
@@ -104,9 +118,9 @@ function profileArgs(profile) {
     '-ac', '2'
   ];
 }
-
+ 
 function inputArgs(profile, url) {
-  const liveTuning = profile === 'live' ? [
+  const liveTuning = (profile === 'live' || profile === 'remux') ? [
     '-fflags', '+genpts+discardcorrupt',
     '-analyzeduration', '2500000',
     '-probesize', '5000000'
@@ -125,13 +139,14 @@ function inputArgs(profile, url) {
     '-i', url
   ];
 }
-
+ 
 function hlsArgs(profile, dir, playlist) {
-  const live = profile === 'live';
+  const live = profile === 'live' || profile === 'remux';
   return [
     '-f', 'hls',
-    '-hls_time', live ? '4' : '6',
+    '-hls_time', live ? '2' : '6',
     '-hls_list_size', live ? '15' : '0',
+    '-hls_delete_threshold', live ? '4' : '1',
     '-hls_flags', live
       ? 'delete_segments+append_list+omit_endlist+independent_segments+temp_file'
       : 'independent_segments+temp_file',
@@ -140,31 +155,10 @@ function hlsArgs(profile, dir, playlist) {
     playlist
   ];
 }
-
-function start(url, profile = 'mobile') {
-  const id = sessionId(url, profile);
-  const existing = sessions.get(id);
-  if (existing && !existing.exited) {
-    existing.lastAccess = Date.now();
-    return existing;
-  }
-
-  const { dir } = safePath(id);
-  fs.rmSync(dir, { recursive: true, force: true });
-  fs.mkdirSync(dir, { recursive: true });
-
-  const playlist = path.join(dir, 'index.m3u8');
-  const args = [
-    ...inputArgs(profile, url),
-    ...profileArgs(profile),
-    '-avoid_negative_ts', 'make_zero',
-    '-muxdelay', '0',
-    '-muxpreload', '0',
-    '-max_muxing_queue_size', '4096',
-    ...hlsArgs(profile, dir, playlist)
-  ];
-
-  const session = { id, url, profile, child: null, playlist, dir, created: Date.now(), lastAccess: Date.now(), exited: false, log: '' };
+ 
+function spawnFfmpeg(session, args) {
+  session.exited = false;
+  session.exitCode = null;
   const child = spawn(FFMPEG, args, { stdio: ['ignore', 'ignore', 'pipe'] });
   session.child = child;
   child.on('error', error => {
@@ -179,10 +173,57 @@ function start(url, profile = 'mobile') {
     session.exited = true;
     session.exitCode = code;
   });
+}
+ 
+function isLiveProfile(profile) {
+  return profile === 'live' || profile === 'remux';
+}
+ 
+function reviveSession(session) {
+  if (!session || !session.exited || !session.spawnArgs) return;
+  if (!isLiveProfile(session.profile)) return;
+  const now = Date.now();
+  if (now - (session.lastRevive || 0) < 5000) return;
+  session.lastRevive = now;
+  session.revives = (session.revives || 0) + 1;
+  session.log = (session.log + `\n[watchdog] restarting ffmpeg (revive #${session.revives})\n`).slice(-4000);
+  spawnFfmpeg(session, session.spawnArgs);
+}
+ 
+function start(url, profile = 'mobile') {
+  const id = sessionId(url, profile);
+  const existing = sessions.get(id);
+  if (existing && !existing.exited) {
+    existing.lastAccess = Date.now();
+    return existing;
+  }
+  if (existing && existing.exited && isLiveProfile(existing.profile) && existing.spawnArgs) {
+    existing.lastAccess = Date.now();
+    reviveSession(existing);
+    return existing;
+  }
+ 
+  const { dir } = safePath(id);
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.mkdirSync(dir, { recursive: true });
+ 
+  const playlist = path.join(dir, 'index.m3u8');
+  const args = [
+    ...inputArgs(profile, url),
+    ...profileArgs(profile),
+    '-avoid_negative_ts', 'make_zero',
+    '-muxdelay', '0',
+    '-muxpreload', '0',
+    '-max_muxing_queue_size', '4096',
+    ...hlsArgs(profile, dir, playlist)
+  ];
+ 
+  const session = { id, url, profile, child: null, playlist, dir, created: Date.now(), lastAccess: Date.now(), exited: false, log: '', spawnArgs: args };
+  spawnFfmpeg(session, args);
   sessions.set(id, session);
   return session;
 }
-
+ 
 async function waitForPlaylist(session, ms = 30000) {
   const file = session.playlist;
   const startAt = Date.now();
@@ -199,7 +240,7 @@ async function waitForPlaylist(session, ms = 30000) {
   }
   return false;
 }
-
+ 
 async function waitForFile(file, ms = 8000) {
   const startAt = Date.now();
   while (Date.now() - startAt < ms) {
@@ -213,7 +254,7 @@ async function waitForFile(file, ms = 8000) {
   }
   return false;
 }
-
+ 
 function cleanup() {
   const now = Date.now();
   for (const [id, session] of sessions) {
@@ -224,7 +265,7 @@ function cleanup() {
   }
 }
 setInterval(cleanup, 60 * 1000).unref();
-
+ 
 function parseJsonBody(req) {
   return new Promise((resolve, reject) => {
     let body = '';
@@ -233,13 +274,13 @@ function parseJsonBody(req) {
     req.on('error', reject);
   });
 }
-
+ 
 const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'OPTIONS') return send(res, 204, '');
     if (!['GET', 'HEAD', 'POST'].includes(req.method)) return send(res, 405, 'Method not allowed');
     const u = new URL(req.url, `http://${req.headers.host}`);
-
+ 
     // --- LICENSING & ADMIN API ROUTES ---
     if (u.pathname.startsWith('/api/')) {
       if (req.method !== 'POST' && req.method !== 'GET') return json(res, 405, { error: 'Method not allowed' });
@@ -250,7 +291,7 @@ const server = http.createServer(async (req, res) => {
         const code = String(body.code || '').trim().toUpperCase();
         const deviceId = String(body.deviceId || '').trim();
         if (!code || !deviceId) return json(res, 400, { error: 'Code and Device ID required' });
-
+ 
         return await new Promise((resolve) => {
           db.get(`SELECT * FROM customers WHERE code = ?`, [code], (err, row) => {
             if (err || !row) return resolve(json(res, 401, { error: 'Invalid activation code' }));
@@ -272,11 +313,11 @@ const server = http.createServer(async (req, res) => {
           });
         });
       }
-
+ 
       // ADMIN DASHBOARD PROTECTION
       const adminKey = req.headers['x-admin-key'];
       if (adminKey !== ADMIN_API_KEY) return json(res, 401, { error: 'Unauthorized' });
-
+ 
       // ADMIN: GENERATE SUBSCRIPTION CODE
       if (u.pathname === '/api/admin/generate') {
         const body = await parseJsonBody(req);
@@ -290,7 +331,7 @@ const server = http.createServer(async (req, res) => {
           });
         });
       }
-
+ 
       // ADMIN: RESET DEVICE (Allow user to switch TVs)
       if (u.pathname === '/api/admin/reset-device') {
         const body = await parseJsonBody(req);
@@ -302,7 +343,7 @@ const server = http.createServer(async (req, res) => {
           });
         });
       }
-
+ 
       // ADMIN: LIST CUSTOMERS
       if (u.pathname === '/api/admin/customers') {
         return await new Promise((resolve) => {
@@ -312,15 +353,15 @@ const server = http.createServer(async (req, res) => {
           });
         });
       }
-
+ 
       return json(res, 404, { error: 'API endpoint not found' });
     }
     // --- END API ROUTES ---
-
+ 
     if (u.pathname === '/health') {
       return json(res, 200, { ok: true, sessions: sessions.size });
     }
-
+ 
     if (u.pathname === '/hls') {
       if (!authorized(u)) return json(res, 401, { error: 'Unauthorized' });
       const source = u.searchParams.get('url');
@@ -337,7 +378,7 @@ const server = http.createServer(async (req, res) => {
       });
       return res.end();
     }
-
+ 
     if (u.pathname.startsWith('/sessions/')) {
       const parts = u.pathname.split('/').filter(Boolean);
       const id = parts[1];
@@ -345,6 +386,7 @@ const server = http.createServer(async (req, res) => {
       const session = sessions.get(id);
       if (!session) return json(res, 404, { error: 'Session expired' });
       session.lastAccess = Date.now();
+      if (session.exited && isLiveProfile(session.profile)) reviveSession(session);
       const { target } = safePath(id, file);
       const ext = path.extname(target);
       const ready = await waitForFile(target, ext === '.m3u8' ? 5000 : 10000);
@@ -387,13 +429,30 @@ const server = http.createServer(async (req, res) => {
       });
       return fs.createReadStream(target).pipe(res);
     }
-
+ 
+    if ((req.method === 'GET' || req.method === 'HEAD') && !u.pathname.includes('..')) {
+      const name = u.pathname === '/' ? 'index.html' : u.pathname.replace(/^\/+/, '');
+      if (STATIC_ALLOW.has(name)) {
+        const target = path.join(__dirname, name);
+        if (fs.existsSync(target) && fs.statSync(target).isFile()) {
+          const ext = path.extname(target).toLowerCase();
+          const body = req.method === 'HEAD' ? '' : fs.readFileSync(target);
+          return send(res, 200, body, {
+            'content-type': staticMime[ext] || 'application/octet-stream',
+            'cache-control': ext === '.html' ? 'no-cache' : 'public, max-age=3600'
+          });
+        }
+      }
+    }
+ 
     json(res, 404, { error: 'Not found' });
   } catch (error) {
     json(res, 500, { error: error.message || 'Server error' });
   }
 });
-
+ 
 server.listen(PORT, () => {
   console.log(`Smarter IPTV transcoder listening on ${PORT}`);
 });
+ 
+
