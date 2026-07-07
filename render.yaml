@@ -2,7 +2,7 @@ services:
   - type: web
     name: smarter-iptv-transcoder
     runtime: docker
-    plan: free
+    plan: starter
     dockerfilePath: ./Dockerfile
     healthCheckPath: /health
     envVars:
@@ -11,9 +11,7 @@ services:
       - key: PORT
         value: 8080
       - key: CORS_ORIGIN
-        value: https://main.smarter-iptv.pages.dev
-      - key: LOW_CPU_MODE
-        value: "true"
+        value: "*"
       - key: PUBLIC_BASE_URL
         sync: false
       - key: ACCESS_TOKEN
