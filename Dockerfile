@@ -1,21 +1,17 @@
-FROM node:20-bookworm-slim
-
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates ffmpeg tini \
-  && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /app
-
-COPY package.json ./
-RUN npm install --omit=dev
-
-COPY server.js ./
-
-ENV NODE_ENV=production
-ENV PORT=8080
-ENV MEDIA_ROOT=/tmp/smarter-iptv-hls
-
-EXPOSE 8080
-
-ENTRYPOINT ["tini", "--"]
-CMD ["node", "server.js"]
+services:
+  transcoder:
+    build: .
+    container_name: smarter-iptv-transcoder
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: "8080"
+      PUBLIC_BASE_URL: "${PUBLIC_BASE_URL}"
+      CORS_ORIGIN: "${CORS_ORIGIN:-*}"
+      ACCESS_TOKEN: "${ACCESS_TOKEN}"
+      MEDIA_ROOT: /tmp/smarter-iptv-hls
+      SESSION_TTL_MS: "1800000"
+    ports:
+      - "8080:8080"
+    tmpfs:
+      - /tmp/smarter-iptv-hls:size=4096m
